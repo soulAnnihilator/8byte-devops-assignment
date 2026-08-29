@@ -16,6 +16,8 @@ permissions:
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: 8byte-assignment-staging
+  SES_FROM: shubhamdwivedi034@gmail.com
+  SES_TO: shubhamdwivedi034@gmail.com
 
 jobs:
   build-test-push:
@@ -25,39 +27,75 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::105045465795:role/githubActions-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install pytest
-        run: python -m pip install pytest
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
 
       - name: Run tests
         run: |
           cd app
           python -m pytest
 
-      - name: Configure AWS credentials
-        if: github.event_name == 'push'
-        uses: aws-actions/configure-aws-credentials@v5
+      - name: Scan dependencies
+        uses: aquasecurity/trivy-action@master
         with:
-          role-to-assume: arn:aws:iam::105045465795:role/githubActions-deploy-role
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        if: github.event_name == 'push'
-        uses: aws-actions/amazon-ecr-login@v2
+          scan-type: fs
+          scan-ref: ./app
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
 
       - name: Build Docker image
-        if: github.event_name == 'push'
         run: |
           docker build \
             -t 105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA} \
             ./app
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
+      - name: Login to Amazon ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Push Docker image
         if: github.event_name == 'push'
         run: |
           docker push \
             105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+
+      - name: Send failure notification
+        if: failure()
+        run: |
+          aws ses send-email \
+            --region "$AWS_REGION" \
+            --from "$SES_FROM" \
+            --destination "ToAddresses=$SES_TO" \
+            --subject "8Byte CI failed - ${{ github.ref_name }}" \
+            --text "CI pipeline failed.
+
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Workflow: ${{ github.workflow }}
+
+          Check the failed workflow run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
