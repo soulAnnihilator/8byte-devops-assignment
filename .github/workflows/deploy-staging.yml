@@ -1,0 +1,63 @@
+name: Deploy Staging
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - master
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: 8byte-assignment-staging
+  ECS_CLUSTER: 8byte-assignment-staging-cluster
+  ECS_SERVICE: 8byte-assignment-staging-service
+  TASK_DEFINITION: 8byte-assignment-staging-app
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::105045465795:role/githubActions-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS task definition
+        run: |
+          IMAGE_URI=105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${{ github.event.workflow_run.head_sha }}
+
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEFINITION \
+            --query taskDefinition \
+            --output json > task-definition.json
+
+          jq --arg IMAGE "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.json > new-task-definition.json
+
+          aws ecs register-task-definition \
+            --cli-input-json file://new-task-definition.json
+
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition $TASK_DEFINITION
+
+      - name: Wait for ECS deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
