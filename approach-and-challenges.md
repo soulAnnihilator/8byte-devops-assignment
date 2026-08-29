@@ -1,193 +1,174 @@
 # Approach & Challenges
 
-## 1. Separating Infrastructure Management from Application Deployment
+This document covers some of the decisions I made while building the assignment and a few issues I came across during the implementation.
 
-One of the design choices was deciding what Terraform should own and what the deployment pipeline should own.
+I focused on getting the staging environment working first and then added the CI, monitoring and other parts around it.
 
-Terraform provisions the infrastructure and creates the initial ECS task definition. After that GitHub Actions is responsible for deploying application versions.
+## 1. Terraform and application deployment
 
-This avoids having Terraform manage every application image update.
+One thing I wanted to keep separate was infrastructure changes and application deployments.
 
-The flow is:
+Terraform creates the VPC, ALB, ECS service, ECR repository, RDS, IAM roles and CloudWatch resources. It also creates the initial ECS task definition.
+
+After that, GitHub Actions handles application deployments.
 
 ```text
 Terraform
-    |
-    +--> VPC
-    +--> ALB
-    +--> ECS
-    +--> ECR
-    +--> RDS
-    +--> IAM
-    +--> CloudWatch
-             |
-             v
-       Initial ECS setup
+   |
+   +-- VPC
+   +-- ALB
+   +-- ECS
+   +-- ECR
+   +-- RDS
+   +-- IAM
+   +-- CloudWatch
 
 GitHub Actions
-    |
-    +--> Build
-    +--> Test
-    +--> Push image
-    +--> Update ECS task definition
+   |
+   +-- Test
+   +-- Build
+   +-- Scan
+   +-- Push image
+   +-- Deploy to ECS
 ```
 
-This separation also avoids a situation where a normal `terraform apply` unintentionally rolls an ECS service back to an older application version.
+This is useful because an application deployment does not need a Terraform change.
 
-For this reason, the ECS service ignores changes to the task definition made by the deployment pipeline.
+I also don't want a normal `terraform apply` to replace the task definition that was updated by the deployment pipeline. The ECS service therefore ignores task definition changes made outside Terraform.
 
----
+## 2. ECS image
 
-## 2. Making the ECS Deployment Reproducible
+I first used a `bootstrap` image so that the ECS service had an image available when the infrastructure was created.
 
-I initially used a fixed `bootstrap` image tag to get the ECS service running.
+There was no image in ECR initially, so the ECS tasks were failing with `CannotPullContainerError`.
 
-This worked for bootstrapping the environment, but it is not a good deployment strategy because the same tag can point to different image versions.
+After building and pushing the image, the tasks started normally and the ALB target became healthy.
 
-The CI pipeline therefore uses the Git commit SHA as the image identifier.
-
-For example:
+For the actual CI deployment, I changed this to use the Git commit SHA as the image tag.
 
 ```text
 8byte-assignment-staging:<commit-sha>
 ```
 
-This gives each deployment an immutable reference.
+I prefer this over `latest` because I can tell which version of the code is running from the ECS task definition.
 
-If a deployment needs to be investigated later, the ECS task definition can be traced back to the exact Git commit that produced the image.
+The `bootstrap` image was only needed to get the initial environment up.
 
-The `bootstrap` image is only used to establish the initial working environment.
+## 3. Terraform state
 
----
+The first Terraform runs used local state.
 
-## 3. Remote Terraform State and State Ownership
-
-The infrastructure was initially developed with local Terraform state because it made the first iteration faster.
-
-Once the infrastructure was working, I moved the staging state to an S3 backend.
-
-The state is stored under:
+Once the infrastructure was working, I moved the staging state to S3.
 
 ```text
-staging/terraform.tfstate
+8byte-assignment-terraform-state
+    |
+    +-- staging/
+          |
+          +-- terraform.tfstate
 ```
 
-The S3 bucket has versioning and encryption enabled.
+The bucket uses encryption and versioning.
 
-This was important because Terraform state contains infrastructure information and should not be treated as a normal source-code file.
+One issue I hit while changing the backend was an S3 `AccessDenied` error. The AWS CLI could see the bucket, but Terraform could not list the objects required during backend migration.
 
-I also kept the backend separate from the infrastructure modules so that the state storage itself does not depend on the state it is responsible for storing.
+After checking the IAM permissions and the S3 access, I was able to initialize Terraform against the S3 backend.
 
-For a larger team, I would additionally restrict access to the state bucket through a dedicated IAM policy and use separate state keys/accounts for each environment.
+I kept the backend configuration separate from the infrastructure modules. The state storage should not depend on the infrastructure state that it is storing.
 
----
+## 4. Network setup and cost
 
-## 4. Network Design vs Cost
+The ALB is in public subnets.
 
-The ECS tasks and RDS database are kept in private subnets, while the ALB is placed in public subnets.
-
-This gives the application a public entry point without making the containers or database directly reachable from the internet.
-
-There is a cost trade-off with the NAT Gateway.
-
-For a small staging environment, I used a single NAT Gateway instead of one per Availability Zone.
-
-This reduces the cost considerably, but it also means the NAT path is not AZ-independent.
-
-I would use multiple NAT Gateways for a production environment where the additional cost is justified by the availability requirement.
-
----
-
-## 5. RDS Availability Decision
-
-The RDS instance is configured as:
+ECS and RDS are in private subnets.
 
 ```text
-Multi-AZ: false
-Publicly accessible: false
-Storage encryption: enabled
+Internet
+   |
+   v
+ ALB
+   |
+   v
+ ECS
+   |
+   v
+ RDS
 ```
 
-This was a deliberate staging decision rather than an assumption that Multi-AZ is always required.
+The RDS security group only allows PostgreSQL traffic from ECS.
 
-The assignment environment does not have a production availability requirement, so paying for Multi-AZ would add cost without providing much value for the demonstration.
+For NAT, I used one NAT Gateway for staging.
 
-For production, I would base the decision on the application's RTO/RPO and database availability requirements.
+Using one per Availability Zone would give better availability, but for this assignment it would add cost without much benefit. I would use multiple NAT Gateways for production if the availability requirement justified the extra cost.
 
----
+## 5. RDS configuration
 
-## 6. Secrets Handling
+The staging database is configured as:
 
-Database credentials are not stored directly in Terraform variables or committed configuration files.
+```text
+Publicly accessible : false
+Storage encryption   : enabled
+Multi-AZ             : false
+Backup retention     : 1 day
+```
 
-The ECS task definition retrieves the database credentials from AWS Secrets Manager.
+I did not enable Multi-AZ for staging because this environment is only being used to demonstrate the deployment.
 
-This keeps the secret value outside the Git repository and avoids passing the password as a normal environment variable.
+For production, I would decide this based on the required RTO/RPO and database availability rather than simply copying the staging settings.
 
-The ECS execution/task roles are separated so that permissions can be assigned based on what each role actually needs.
+## 6. Secrets
 
-For production, I would also review secret rotation requirements and reduce the scope of Secrets Manager access to the specific secret ARN.
+The database username and password are stored in Secrets Manager.
 
----
+They are not present in the Git repository or Docker image.
 
-## 7. Monitoring Design
+The ECS task definition references the individual values from the secret.
 
-I separated the CloudWatch dashboards into two views instead of putting every metric into one dashboard.
+The ECS execution role and task role are separate. This gives me a cleaner boundary between permissions needed by ECS itself and permissions needed by the application.
 
-### Application dashboard
+For production, I would also enable secret rotation where appropriate and restrict access to the specific secret rather than giving broader Secrets Manager permissions.
 
-This is intended to answer:
+## 7. Monitoring
 
-> Is the application receiving traffic and responding correctly?
+I created two CloudWatch dashboards.
 
-It focuses on ALB and ECS metrics such as:
+The first one is focused on the application:
 
-* Request count
-* HTTP errors
-* Target response time
-* ECS CPU
-* ECS memory
+```text
+8byte-assignment-staging-application
+```
 
-### Platform dashboard
+It contains things such as request count, HTTP errors, response time and ECS CPU/memory.
 
-This is intended to answer:
+The second one is focused more on the platform:
 
-> Is there an infrastructure or database problem?
+```text
+8byte-assignment-staging-platform
+```
 
-It focuses on:
+It contains ECS, RDS and ALB metrics such as CPU, memory, database connections, storage and target health.
 
-* ECS resource utilization
-* RDS CPU
-* RDS connections
-* RDS storage
-* ALB target health
+I kept them separate because when troubleshooting an application issue I don't necessarily want to look through all the database and infrastructure metrics at the same time.
 
-The separation makes the dashboards more useful during troubleshooting instead of having one large dashboard with unrelated metrics.
+## 8. Logging
 
----
+ECS sends the application container logs to CloudWatch Logs.
 
-## 8. Logging Strategy
+The current log group is:
 
-Application logs from ECS are sent directly to CloudWatch Logs using the ECS `awslogs` driver.
+```text
+/ecs/8byte-assignment-staging
+```
 
-This means the container does not need to manage log files locally and operators can inspect logs after a task is replaced.
+The application doesn't need to maintain log files on the container itself. If the ECS task is replaced, the logs are still available in CloudWatch.
 
-For a production implementation, I would extend this with:
+For a larger production setup, I would add structured application logs, request/correlation IDs, log retention settings and ALB access logging.
 
-* CloudWatch alarms
-* Log retention policies
-* Structured JSON application logs
-* Correlation/request IDs
-* ALB access logging
-* Centralized security/audit logging
+## 9. CI/CD
 
-These were kept outside the initial implementation to keep the assignment focused on the core infrastructure and deployment path.
+I kept CI and deployment as separate workflows.
 
----
-
-## 9. CI/CD Boundary
-
-The pipeline was intentionally kept simple:
+The CI workflow runs for pull requests and pushes to `master`.
 
 ```text
 Pull Request
@@ -195,49 +176,75 @@ Pull Request
      v
     CI
      |
-     +--> Tests
-     +--> Docker build
+     +-- Tests
+     +-- Dependency scan
+     +-- Docker build
+     +-- Docker image scan
+
 
 Merge to master
      |
      v
     CI
      |
-     +--> Tests
-     +--> Docker build
-     +--> Push to ECR
-              |
-              v
-        Deploy Staging
-              |
-              v
-             ECS
+     +-- Tests
+     +-- Dependency scan
+     +-- Docker build
+     +-- Docker image scan
+     +-- Push image to ECR
+                     |
+                     v
+               Deploy staging
+                     |
+                     v
+                    ECS
 ```
 
-I preferred a small pipeline that is easy to understand and troubleshoot over adding several deployment stages that were not necessary for the staging environment.
+Trivy is used for the dependency/file scan and for the Docker image scan.
 
-Production deployment, manual approval, vulnerability scanning and notifications are identified as the next steps rather than being added without validating the underlying deployment flow first.
+The pipeline fails for HIGH and CRITICAL findings that are not ignored as unfixed.
 
----
+The CI workflow also sends an email through SES if the workflow fails.
 
-# Things I Would Add for Production
+GitHub Actions uses OIDC to assume the AWS IAM role, so there is no AWS access key stored in GitHub.
 
-The current implementation is intentionally focused on the assignment's staging environment.
+I kept the pipeline fairly small because it is easier to troubleshoot and there was no need to add extra deployment stages for staging.
 
-For a production implementation, I would add:
+## 10. Production environment
 
-* Separate production AWS account/environment
-* Manual approval before production deployment
-* Container vulnerability scanning
-* Dependency scanning
-* CloudWatch alarms and alerting
-* Slack/email notifications
-* ALB access logs
-* Structured application logs
-* RDS Multi-AZ where required
-* Automated rollback verification
-* More restrictive IAM policies
-* Formal Terraform remote-state access controls
-* CI checks for Terraform formatting, validation and security scanning
+The production Terraform configuration is present in the repository but I did not provision it.
 
-These are improvements based on operational requirements rather than simply adding more services to the architecture.
+The same modules are used for staging and production, with environment-specific values.
+
+Some of the values that I would change for production are:
+
+```text
+ECS task count
+RDS instance size
+RDS Multi-AZ
+Backup retention
+NAT Gateway setup
+```
+
+I would also use a separate AWS account for production.
+
+The production deployment would have a manual approval before changing the ECS service.
+
+## Things I would add before production
+
+The staging flow is working, but I would add a few things before using the same setup for an actual production workload:
+
+* CloudWatch alarms for important failure and capacity conditions
+* Manual approval for production deployment
+* Deployment rollback verification
+* ALB access logging
+* Separate AWS account for production
+* Tighter IAM policies
+* Terraform validation and security checks in CI
+* Longer and environment-specific RDS backup settings
+
+The vulnerability scans and CI failure email notification are already part of the current CI workflow, so they are not listed as future work.
+
+## Best practices used
+
+The implementation details and reasoning around state management, IAM, networking, secrets, CI/CD, monitoring and cost are covered in `best-practices.md`.
