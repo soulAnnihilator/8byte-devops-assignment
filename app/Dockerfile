@@ -1,13 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-COPY app.py .
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home appuser && \
-    chown -R appuser:appuser /app
-
-USER appuser
+COPY . .
 
 EXPOSE 8080
 
