@@ -15,6 +15,7 @@ permissions:
 
 env:
   AWS_REGION: ap-south-1
+  ECR_REGISTRY: 105045465795.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: 8byte-assignment-staging
   SES_FROM: shubhamdwivedi034@gmail.com
   SES_TO: shubhamdwivedi034@gmail.com
@@ -61,13 +62,13 @@ jobs:
       - name: Build Docker image
         run: |
           docker build \
-            -t 105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA \
             ./app
 
       - name: Scan Docker image
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: 105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: 1
@@ -80,7 +81,7 @@ jobs:
         if: github.event_name == 'push'
         run: |
           docker push \
-            105045465795.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+            $ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA
 
       - name: Send failure notification
         if: failure()
